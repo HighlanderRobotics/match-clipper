@@ -3,6 +3,8 @@ token.json
 *.DS_Store
 .env
 
+input.mp4
+
 # Added by cargo
 
 /target
