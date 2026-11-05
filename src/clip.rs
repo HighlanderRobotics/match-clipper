@@ -204,7 +204,7 @@ pub fn plan_matches(
 }
 pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> Result<()> {
     let partial = path.with_extension("partial.mp4");
-    let status = Command::new("yt-dlp")
+    let download = Command::new("yt-dlp")
         .args([
             "--ignore-config",
             "--no-playlist",
@@ -236,16 +236,35 @@ pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> R
         .arg("--")
         .arg(format!("https://www.youtube.com/watch?v={video_id}"))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .status();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(900), status).await;
+        .output();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(900), download).await;
     match result {
-        Ok(Ok(s)) if s.success() => {}
-        _ => {
+        Ok(Ok(output)) if output.status.success() => {
+            crate::logging::debug(
+                "download_diagnostics",
+                "Downloader finished",
+                serde_json::json!({"diagnosticBytes":output.stdout.len()+output.stderr.len()}),
+            );
+        }
+        Ok(Ok(output)) => {
             let _ = tokio::fs::remove_file(&partial).await;
-            bail!("Download failed or timed out for {}", clip.match_key);
+            bail!(
+                "Download failed for {} ({}): {}",
+                clip.match_key,
+                output.status,
+                crate::logging::diagnostic(&String::from_utf8_lossy(&output.stderr))
+            );
+        }
+        Ok(Err(error)) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            bail!("Could not run yt-dlp: {error}");
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            bail!("Download timed out after 15 minutes for {}", clip.match_key);
         }
     }
     let output = Command::new("ffprobe")

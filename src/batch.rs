@@ -1,3 +1,4 @@
+use crate::logging;
 use crate::{
     authenticate,
     cli::ClipArgs,
@@ -7,6 +8,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -64,9 +66,16 @@ fn validate_manifest(m: &Manifest, plan: &Plan) -> Result<()> {
     }
     Ok(())
 }
+fn needs_upload(no_upload: bool, manifest: &Manifest) -> bool {
+    !no_upload
+        && manifest
+            .progress
+            .iter()
+            .any(|p| p.status != Status::Uploaded)
+}
 pub async fn run(args: ClipArgs) -> Result<()> {
     let http = Client::builder()
-        .user_agent("frc-match-clipper/0.1")
+        .user_agent(concat!("frc-match-clipper/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let plan = clip::load_plan(&http, &args).await?;
@@ -121,7 +130,7 @@ async fn run_locked(
         }
     };
     save(path, &manifest).await?;
-    let google = if args.no_upload {
+    let google = if !needs_upload(args.no_upload, &manifest) {
         None
     } else {
         Some(load_google_client()?)
@@ -130,31 +139,83 @@ async fn run_locked(
     if let Some(g) = &google {
         authenticate(http, g).await?;
     }
-    println!("{} matches; output {}", plan.clips.len(), dir.display());
+    let started = std::time::Instant::now();
+    let mut resumed = 0;
+    logging::info(
+        "batch_start",
+        &format!(
+            "{} · {} matches · {} · output {}",
+            plan.event,
+            plan.clips.len(),
+            plan.privacy,
+            dir.display()
+        ),
+        json!({"matches":plan.clips.len(),"output":dir,"privacy":plan.privacy}),
+    );
+    if plan.skipped_without_actual_time > 0 {
+        logging::warn(
+            "missing_timestamps",
+            &format!(
+                "{} matches have no actual start timestamp and were skipped",
+                plan.skipped_without_actual_time
+            ),
+            json!({"skipped":plan.skipped_without_actual_time}),
+        );
+    }
     let mut failed = 0;
     for (i, c) in plan.clips.iter().enumerate() {
         if manifest.progress[i].status == Status::Uploaded {
-            println!("{} already uploaded; skipping", c.match_key);
+            resumed += 1;
+            logging::info(
+                "clip_resumed",
+                &format!(
+                    "[{}/{}] {} · already uploaded; skipping",
+                    i + 1,
+                    plan.clips.len(),
+                    c.match_key
+                ),
+                json!({"match":c.match_key,"videoId":manifest.progress[i].uploaded_video_id}),
+            );
             continue;
         }
         let file = dir.join(format!("{}.mp4", c.match_key));
         if manifest.progress[i].status != Status::Clipped || !tokio::fs::try_exists(&file).await? {
-            println!(
-                "[{}/{}] {}: {:.0}–{:.0}s",
-                i + 1,
-                plan.clips.len(),
-                c.match_key,
-                c.start_seconds,
-                c.end_seconds
+            let clip_started = std::time::Instant::now();
+            logging::info(
+                "clip_start",
+                &format!(
+                    "[{}/{}] {} · downloading {}–{}s",
+                    i + 1,
+                    plan.clips.len(),
+                    c.match_key,
+                    c.start_seconds,
+                    c.end_seconds
+                ),
+                json!({"match":c.match_key,"index":i+1,"total":plan.clips.len(),"startSeconds":c.start_seconds,"endSeconds":c.end_seconds}),
             );
             if let Err(e) = clip::download_clip(&plan.video_id, c, &file).await {
                 manifest.progress[i].status = Status::ClipFailed;
                 manifest.progress[i].error = Some(e.to_string());
                 save(path, &manifest).await?;
-                eprintln!("{e:#}");
+                logging::error(
+                    "clip_failed",
+                    &format!("{} · {e:#}", c.match_key),
+                    json!({"match":c.match_key}),
+                );
                 failed += 1;
                 continue;
             }
+            let bytes = tokio::fs::metadata(&file).await?.len();
+            logging::info(
+                "clip_ready",
+                &format!(
+                    "{} · clip ready · {:.1} MB · {:.1}s",
+                    c.match_key,
+                    bytes as f64 / 1048576.0,
+                    clip_started.elapsed().as_secs_f64()
+                ),
+                json!({"match":c.match_key,"bytes":bytes,"seconds":clip_started.elapsed().as_secs_f64()}),
+            );
             manifest.progress[i].status = Status::Clipped;
             manifest.progress[i].error = None;
             save(path, &manifest).await?;
@@ -177,7 +238,14 @@ async fn run_locked(
                     manifest.progress[i].status = Status::Uploaded;
                     manifest.progress[i].uploaded_video_id = Some(id.clone());
                     save(path, &manifest).await?;
-                    println!("{} https://www.youtube.com/watch?v={id}", c.match_key);
+                    logging::info(
+                        "upload_complete",
+                        &format!(
+                            "{} · uploaded · https://www.youtube.com/watch?v={id}",
+                            c.match_key
+                        ),
+                        json!({"match":c.match_key,"videoId":id}),
+                    );
                     if !args.keep_clips {
                         tokio::fs::remove_file(&file).await?;
                     }
@@ -194,7 +262,12 @@ async fn run_locked(
     if failed > 0 {
         bail!("{failed} clips failed. Successful uploads are saved; rerun the same command to retry failed downloads");
     }
-    println!("Complete. Manifest: {}", path.display());
+    let uploaded = manifest
+        .progress
+        .iter()
+        .filter(|p| p.status == Status::Uploaded)
+        .count();
+    logging::info("batch_complete",&format!("Complete · {} matches · {uploaded} uploaded · {resumed} resumed · {:.1}s · manifest {}",plan.clips.len(),started.elapsed().as_secs_f64(),path.display()),json!({"matches":plan.clips.len(),"uploaded":uploaded,"resumed":resumed,"failed":failed,"seconds":started.elapsed().as_secs_f64(),"manifest":path}));
     Ok(())
 }
 #[cfg(test)]
@@ -221,6 +294,15 @@ mod tests {
                 error: None,
             }],
         }
+    }
+    #[test]
+    fn completed_manifests_do_not_require_google_login() {
+        let mut m = manifest();
+        assert!(needs_upload(false, &m));
+        assert!(!needs_upload(true, &m));
+        m.progress[0].status = Status::Uploaded;
+        m.progress[0].uploaded_video_id = Some("abcdefghijk".into());
+        assert!(!needs_upload(false, &m));
     }
     #[test]
     fn resume_requires_same_plan() {

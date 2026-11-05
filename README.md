@@ -2,16 +2,34 @@
 
 A Rust CLI that turns an archived YouTube livestream into one video per played FRC match and uploads each clip to YouTube. Match times come from The Blue Alliance. Successful uploads are checkpointed in a local manifest so interrupted runs do not upload them again.
 
-## Setup
-
-Install Rust, `yt-dlp`, FFmpeg (including `ffprobe`), and Node.js (used by yt-dlp's JavaScript extractor). Then:
+## Install with Homebrew
 
 ```sh
-cargo build --release
-cp .env.example .env
+brew tap jackshim415/frc-match-clipper https://github.com/jackshim415/frc-match-clipper.git
+brew install jackshim415/frc-match-clipper/frc-match-clipper
+frc-match-clipper --version
 ```
 
-Set `TBA_API_KEY` (or `TBA_KEY`) and `YOUTUBE_API_KEY`. For uploads, place an installed-application Google OAuth client in `client_secret.json`, enable YouTube Data API v3, and allow `http://127.0.0.1:8765/callback`. The first upload opens Google's authorization page. Later runs refresh `token.json` as needed. Keep these files private; they are ignored by Git.
+The tap lives in this repository. Use both commands the first time: Homebrew's default repository naming differs from this source repository. Homebrew builds the pinned release from source and installs Rust as a build dependency, plus FFmpeg, yt-dlp, and Node.js as runtime dependencies. After installation, the command is on your normal PATH; you do not run it through Cargo.
+
+Update with `brew update` followed by `brew upgrade frc-match-clipper`. Uninstall with `brew uninstall frc-match-clipper`; configuration and uploaded videos are retained.
+
+Alternatively, with a current Rust toolchain and the runtime tools installed:
+
+```sh
+cargo install --locked --git https://github.com/jackshim415/frc-match-clipper.git --tag v0.2.0
+```
+
+## Configure once
+
+`frc-match-clipper config-path` prints the configuration directory. It defaults to `~/.config/frc-match-clipper` (or `$XDG_CONFIG_HOME/frc-match-clipper`). Put these files there:
+
+- `.env`: `TBA_API_KEY` (or `TBA_KEY`) and `YOUTUBE_API_KEY`, one `NAME=value` per line.
+- `client_secret.json`: an installed-application Google OAuth client with YouTube Data API v3 enabled and `http://127.0.0.1:8765/callback` permitted.
+
+The first upload opens Google's authorization page and writes `token.json` with owner-only permissions. Later uploads refresh the token as needed. Keep the configuration directory private (`chmod 700`) and `.env`/OAuth files private (`chmod 600`). These files are never part of the package.
+
+Use `--config-dir DIR` or `FRC_CLIPPER_CONFIG_DIR` to select another directory. Shell environment variables take precedence over `.env`. For existing checkouts, a working-directory `.env` and paired `client_secret.json`/`token.json` continue to work when the user configuration directory has no client file.
 
 ## Clip an event livestream
 
@@ -29,7 +47,7 @@ frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
   --event 2026cacg
 ```
 
-Use `target/release/frc-match-clipper` in place of the command if it is not on your PATH. Videos default to **unlisted**; use `--privacy private` or `--privacy public` explicitly to change that. Uploads go to the channel authorized by the cached Google token. The CLI does not publish links to TBA or modify Lovat.
+Videos default to **unlisted**; use `--privacy private` or `--privacy public` explicitly to change that. Uploads go to the channel authorized by the cached Google token. The CLI does not publish links to TBA or modify Lovat.
 
 The default clip starts eight seconds before the TBA actual start, includes 163 seconds of play/transition, and retains 15 seconds afterward. Use `--match-duration` for another season or event rules. Qualifications and playoffs are both included when their actual timestamps lie inside the stream. Missing actual timestamps are counted in the plan and skipped; estimates from scheduled times are never used.
 
@@ -53,6 +71,18 @@ YouTube quota, provider throttling, and account upload limits can stop a large b
 frc-match-clipper upload match.mp4 --title 'CalGames QM1' \
   --description 'FRC match footage' --privacy unlisted
 ```
+
+## Logging
+
+Logs go to stderr, leaving `--dry-run` JSON on stdout available for scripts. Human logs show local timestamps, match progress, download sizes/timings, coarse upload progress, resume decisions, and a completion summary. FFmpeg chatter is suppressed; downloader failures include a short diagnostic with URLs redacted. Terminal output uses color; redirected output does not. `NO_COLOR` and `--no-color` disable it explicitly.
+
+```sh
+frc-match-clipper --log-format json clip LIVESTREAM --event EVENT 2>run.jsonl
+frc-match-clipper --verbose clip LIVESTREAM --event EVENT
+frc-match-clipper --quiet clip LIVESTREAM --event EVENT
+```
+
+JSON logs contain `timestamp` (UTC), `level`, `event`, `message`, and structured `fields`. Quiet mode retains warnings/errors. Verbose mode adds timings/context without exposing credentials or signed media URLs. Resolve failed/uncertain uploads using the manifest instructions above, then rerun the same command.
 
 ## Checks
 

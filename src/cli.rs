@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --dry-run               Print clip plan without downloading/uploading\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the current directory.\n";
+pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --dry-run               Print clip plan without downloading/uploading\n\nGlobal options (before or after the command):\n  --log-format text|json  Human logs or JSON lines on stderr\n  --quiet                Only warnings and errors\n  --verbose              Debug timings and context\n  --no-color             Disable ANSI colors\n  --config-dir DIR       Directory containing .env and Google credentials\n  --version              Print version\n  config-path            Print the default configuration directory\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the current directory.\n";
 
 #[derive(Debug, Clone)]
 pub struct ClipArgs {
@@ -22,6 +22,8 @@ pub struct ClipArgs {
 #[derive(Debug)]
 pub enum Command {
     Help,
+    Version,
+    ConfigPath,
     Clip(ClipArgs),
     Upload {
         file: PathBuf,
@@ -39,6 +41,12 @@ fn privacy(value: String) -> Result<String> {
 pub fn parse(args: Vec<String>) -> Result<Command> {
     if args.is_empty() || args.iter().any(|s| s == "--help" || s == "-h") {
         return Ok(Command::Help);
+    }
+    if args == ["--version"] || args == ["-V"] {
+        return Ok(Command::Version);
+    }
+    if args == ["config-path"] {
+        return Ok(Command::ConfigPath);
     }
     let command = args[0].as_str();
     if !["clip", "upload"].contains(&command) {
@@ -153,11 +161,93 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
         dry_run: options.contains_key("--dry-run"),
     }))
 }
+pub fn global_options(
+    args: Vec<String>,
+) -> Result<(Vec<String>, crate::logging::Settings, Option<PathBuf>)> {
+    let mut clean = Vec::new();
+    let mut settings = crate::logging::Settings::default();
+    let mut config = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        if [
+            "--quiet",
+            "--verbose",
+            "--no-color",
+            "--log-format",
+            "--config-dir",
+        ]
+        .contains(&key)
+        {
+            if !seen.insert(key.to_owned()) {
+                bail!("Duplicate option {key}");
+            }
+            match key {
+                "--quiet" => settings.quiet = true,
+                "--verbose" => settings.verbose = true,
+                "--no-color" => settings.no_color = true,
+                _ => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .filter(|s| !s.starts_with("--"))
+                        .with_context(|| format!("Missing value after {key}"))?;
+                    if key == "--config-dir" {
+                        config = Some(v.into());
+                    } else {
+                        match v.as_str() {
+                            "text" => settings.json = false,
+                            "json" => settings.json = true,
+                            _ => bail!("--log-format must be text or json"),
+                        }
+                    }
+                }
+            }
+        } else {
+            clean.push(args[i].clone());
+        }
+        i += 1;
+    }
+    if settings.quiet && settings.verbose {
+        bail!("Use either --quiet or --verbose");
+    }
+    Ok((clean, settings, config))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+    #[test]
+    fn global_settings_anywhere() {
+        let (a,s,c)=global_options(args("--log-format json clip abcdefghijk --event 2026cacg --config-dir /tmp/config --verbose")).unwrap();
+        assert!(s.json && s.verbose);
+        assert_eq!(c, Some(PathBuf::from("/tmp/config")));
+        assert!(matches!(parse(a).unwrap(), Command::Clip(_)));
+    }
+    #[test]
+    fn reject_bad_global_flags() {
+        for s in [
+            "--quiet --verbose",
+            "--log-format xml",
+            "--config-dir",
+            "--quiet --quiet",
+        ] {
+            assert!(global_options(args(s)).is_err());
+        }
+    }
+    #[test]
+    fn version_and_config_path() {
+        assert!(matches!(
+            parse(args("--version")).unwrap(),
+            Command::Version
+        ));
+        assert!(matches!(
+            parse(args("config-path")).unwrap(),
+            Command::ConfigPath
+        ));
     }
     #[test]
     fn defaults_and_signed_offsets() {

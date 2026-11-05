@@ -1,6 +1,8 @@
 mod batch;
 mod cli;
 mod clip;
+mod config;
+mod logging;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Query, State},
@@ -118,7 +120,13 @@ fn random_string(length: usize) -> String {
 }
 
 fn load_google_client() -> Result<GoogleClient> {
-    let data = fs::read(CLIENT_FILE).context("Put client_secret.json in the project root")?;
+    let path = config::credential_file(CLIENT_FILE);
+    let data = fs::read(&path).with_context(|| {
+        format!(
+            "Put client_secret.json in {}",
+            config::directory().display()
+        )
+    })?;
     let file: GoogleClientFile = serde_json::from_slice(&data)?;
 
     file.installed
@@ -135,7 +143,11 @@ fn save_token(token: &Token) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(TOKEN_FILE)?;
+    let path = config::credential_file(TOKEN_FILE);
+    if let Some(parent) = path.parent() {
+        config::ensure_directory(parent)?;
+    }
+    let mut file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -168,7 +180,10 @@ async fn exchange_code(
     let body = response.text().await?;
 
     if !status.is_success() {
-        bail!("OAuth token exchange failed ({status}): {body}");
+        bail!(
+            "OAuth token exchange failed ({status}): {}",
+            provider_error(&body)
+        );
     }
 
     let data: TokenResponse = serde_json::from_str(&body)?;
@@ -203,7 +218,11 @@ async fn refresh_token(http: &Client, google: &GoogleClient, old: &Token) -> Res
     let body = response.text().await?;
 
     if !status.is_success() {
-        bail!("Token refresh failed ({status}): {body}");
+        bail!(
+            "Token refresh failed ({status}): {}. Reauthorize using the token file in {}",
+            provider_error(&body),
+            config::credential_directory().display()
+        );
     }
 
     let data: TokenResponse = serde_json::from_str(&body)?;
@@ -241,7 +260,7 @@ async fn callback(
 }
 
 async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
-    if let Ok(bytes) = fs::read(TOKEN_FILE) {
+    if let Ok(bytes) = fs::read(config::credential_file(TOKEN_FILE)) {
         if let Ok(token) = serde_json::from_slice::<Token>(&bytes) {
             if token.expires_at > now() + 60 {
                 return Ok(token);
@@ -288,10 +307,17 @@ async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
         let _ = axum::serve(listener, app).await;
     });
 
-    println!("Opening Google authorization in your browser...");
+    logging::info(
+        "auth_start",
+        "Opening Google authorization in your browser",
+        serde_json::json!({}),
+    );
     if let Err(error) = open::that(auth_url.as_str()) {
-        eprintln!("Could not open browser automatically: {error}");
-        println!("Open this URL manually:\n{auth_url}");
+        logging::warn(
+            "auth_browser_failed",
+            &format!("Could not open browser: {error}. Open {auth_url}"),
+            serde_json::json!({}),
+        );
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
@@ -361,7 +387,10 @@ async fn upload(
 
     let status = init.status();
     if !status.is_success() {
-        bail!("Could not start upload ({status}): {}", init.text().await?);
+        bail!(
+            "Could not start upload ({status}): {}",
+            provider_error(&init.text().await?)
+        );
     }
 
     let upload_url = init
@@ -372,6 +401,14 @@ async fn upload(
         .to_string();
 
     let mut offset = 0_u64;
+    let mut last_step = 0;
+    let upload_started = std::time::Instant::now();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    logging::info(
+        "upload_start",
+        &format!("{name} · uploading {:.1} MB", size as f64 / 1048576.0),
+        serde_json::json!({"bytes":size}),
+    );
 
     while offset < size {
         let remaining = size - offset;
@@ -384,11 +421,6 @@ async fn upload(
         let end = offset + count as u64 - 1;
         let range = format!("bytes {offset}-{end}/{size}");
 
-        println!(
-            "Uploading {:.1}%...",
-            (end + 1) as f64 / size as f64 * 100.0
-        );
-
         let response = http
             .put(&upload_url)
             .header("Content-Type", "video/mp4")
@@ -399,6 +431,24 @@ async fn upload(
             .await?;
 
         let status = response.status();
+        if status == StatusCode::PERMANENT_REDIRECT
+            || status == StatusCode::OK
+            || status == StatusCode::CREATED
+        {
+            let percent = (end + 1) * 100 / size;
+            if percent / 25 > last_step || end + 1 == size {
+                last_step = percent / 25;
+                logging::info(
+                    "upload_progress",
+                    &format!(
+                        "{name} · {percent}% ({:.1}/{:.1} MB)",
+                        (end + 1) as f64 / 1048576.0,
+                        size as f64 / 1048576.0
+                    ),
+                    serde_json::json!({"percent":percent,"bytesSent":end+1,"totalBytes":size}),
+                );
+            }
+        }
 
         if status == StatusCode::PERMANENT_REDIRECT {
             offset += count as u64;
@@ -407,20 +457,62 @@ async fn upload(
 
         if status == StatusCode::OK || status == StatusCode::CREATED {
             let result: UploadResponse = response.json().await?;
+            logging::debug(
+                "upload_timing",
+                "Upload completed",
+                serde_json::json!({"seconds":upload_started.elapsed().as_secs_f64()}),
+            );
             return Ok(result.id);
         }
 
-        bail!("Upload failed ({status}): {}", response.text().await?);
+        bail!(
+            "Upload failed ({status}): {}",
+            provider_error(&response.text().await?)
+        );
     }
 
     bail!("Upload ended without YouTube confirming completion")
 }
 
+fn provider_error(body: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let reason = value
+        .get("error")
+        .and_then(|e| {
+            e.as_str()
+                .or_else(|| e.pointer("/errors/0/reason").and_then(|v| v.as_str()))
+                .or_else(|| e.get("status").and_then(|v| v.as_str()))
+        })
+        .unwrap_or("provider rejected the request");
+    reason
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " _-.".contains(*c))
+        .take(100)
+        .collect()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
-    match cli::parse(std::env::args().skip(1).collect())? {
+async fn main() {
+    if let Err(error) = run_cli().await {
+        logging::error(
+            "command_failed",
+            &format!("{error:#}"),
+            serde_json::json!({}),
+        );
+        std::process::exit(1);
+    }
+}
+async fn run_cli() -> Result<()> {
+    let (args, settings, directory) = cli::global_options(std::env::args().skip(1).collect())?;
+    logging::init(settings);
+    let command = cli::parse(args)?;
+    if !matches!(&command, cli::Command::Help | cli::Command::Version) {
+        config::init(directory)?;
+    }
+    match command {
         cli::Command::Help => println!("{}", cli::HELP),
+        cli::Command::Version => println!("frc-match-clipper {}", env!("CARGO_PKG_VERSION")),
+        cli::Command::ConfigPath => println!("{}", config::directory().display()),
         cli::Command::Clip(args) => batch::run(args).await?,
         cli::Command::Upload {
             file,
@@ -430,13 +522,33 @@ async fn main() -> Result<()> {
         } => {
             let google = load_google_client()?;
             let http = Client::builder()
-                .user_agent("frc-match-clipper/0.1")
+                .user_agent(concat!("frc-match-clipper/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(120))
                 .build()?;
             let token = authenticate(&http, &google).await?;
             let id = upload(&http, &token, &file, &title, &description, &privacy).await?;
-            println!("Upload complete: https://www.youtube.com/watch?v={id}");
+            logging::info(
+                "upload_complete",
+                &format!("Uploaded: https://www.youtube.com/watch?v={id}"),
+                serde_json::json!({"videoId":id}),
+            );
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod provider_tests {
+    #[test]
+    fn errors_do_not_echo_provider_secrets() {
+        assert_eq!(
+            super::provider_error(r#"{"error":"invalid_grant","access_token":"do-not-print"}"#),
+            "invalid_grant"
+        );
+        assert_eq!(
+            super::provider_error(
+                r#"{"error":{"errors":[{"reason":"quotaExceeded"}],"message":"sensitive"}}"#
+            ),
+            "quotaExceeded"
+        );
+    }
 }
