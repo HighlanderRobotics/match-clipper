@@ -5,8 +5,8 @@ A Rust CLI that turns an archived YouTube livestream into one video per played F
 ## Install with Homebrew
 
 ```sh
-brew tap jackshim415/frc-match-clipper https://github.com/jackshim415/frc-match-clipper.git
-brew install jackshim415/frc-match-clipper/frc-match-clipper
+brew tap jackshim415/match-clipper https://github.com/jackshim415/match-clipper.git
+brew install jackshim415/match-clipper/frc-match-clipper
 frc-match-clipper --version
 ```
 
@@ -17,7 +17,7 @@ Update with `brew update` followed by `brew upgrade frc-match-clipper`. Uninstal
 Alternatively, with a current Rust toolchain and the runtime tools installed:
 
 ```sh
-cargo install --locked --git https://github.com/jackshim415/frc-match-clipper.git --tag v0.2.0
+cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.0
 ```
 
 ## Configure once

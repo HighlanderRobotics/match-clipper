@@ -1,7 +1,7 @@
 class FrcMatchClipper < Formula
   desc "Clip FRC livestreams into match videos with resumable YouTube uploads"
-  homepage "https://github.com/jackshim415/frc-match-clipper"
-  url "https://github.com/jackshim415/frc-match-clipper.git",
+  homepage "https://github.com/jackshim415/match-clipper"
+  url "https://github.com/jackshim415/match-clipper.git",
       tag: "v0.2.0",
       revision: "0aec3285aea8a2eb6077e4dfe97239e59054fc92"
   version "0.2.0"
