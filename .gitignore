@@ -8,3 +8,7 @@ input.mp4
 # Added by cargo
 
 /target
+
+/clips/
+*.mp4
+*.webm

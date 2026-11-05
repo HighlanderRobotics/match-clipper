@@ -1,4 +1,6 @@
-
+mod batch;
+mod cli;
+mod clip;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Query, State},
@@ -17,7 +19,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{io::{AsyncReadExt, AsyncSeekExt}, net::TcpListener};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    net::TcpListener,
+};
 use url::Url;
 
 const CLIENT_FILE: &str = "client_secret.json";
@@ -113,13 +118,31 @@ fn random_string(length: usize) -> String {
 }
 
 fn load_google_client() -> Result<GoogleClient> {
-    let data = fs::read(CLIENT_FILE)
-        .context("Put client_secret.json in the project root")?;
+    let data = fs::read(CLIENT_FILE).context("Put client_secret.json in the project root")?;
     let file: GoogleClientFile = serde_json::from_slice(&data)?;
 
     file.installed
         .or(file.web)
         .context("OAuth JSON has no installed or web client")
+}
+
+fn save_token(token: &Token) -> Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(TOKEN_FILE)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&serde_json::to_vec_pretty(token)?)?;
+    Ok(())
 }
 
 async fn exchange_code(
@@ -155,16 +178,14 @@ async fn exchange_code(
         expires_at: now() + data.expires_in.unwrap_or(3600),
     };
 
-    fs::write(TOKEN_FILE, serde_json::to_vec_pretty(&token)?)?;
+    save_token(&token)?;
     Ok(token)
 }
 
-async fn refresh_token(
-    http: &Client,
-    google: &GoogleClient,
-    old: &Token,
-) -> Result<Token> {
-    let refresh = old.refresh_token.as_deref()
+async fn refresh_token(http: &Client, google: &GoogleClient, old: &Token) -> Result<Token> {
+    let refresh = old
+        .refresh_token
+        .as_deref()
         .context("No refresh token. Delete token.json and authenticate again.")?;
 
     let response = http
@@ -192,7 +213,7 @@ async fn refresh_token(
         expires_at: now() + data.expires_in.unwrap_or(3600),
     };
 
-    fs::write(TOKEN_FILE, serde_json::to_vec_pretty(&token)?)?;
+    save_token(&token)?;
     Ok(token)
 }
 
@@ -237,7 +258,8 @@ async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
 
     let mut auth_url = Url::parse(&google.auth_uri)?;
-    auth_url.query_pairs_mut()
+    auth_url
+        .query_pairs_mut()
         .append_pair("client_id", &google.client_id)
         .append_pair("redirect_uri", REDIRECT)
         .append_pair("response_type", "code")
@@ -258,7 +280,8 @@ async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
         .route("/callback", get(callback))
         .with_state(app_state);
 
-    let listener = TcpListener::bind("127.0.0.1:8765").await
+    let listener = TcpListener::bind("127.0.0.1:8765")
+        .await
         .context("Cannot bind OAuth callback port 8765")?;
 
     let server = tokio::spawn(async move {
@@ -302,7 +325,8 @@ async fn upload(
         bail!("Privacy must be private, unlisted, or public");
     }
 
-    let mut file = tokio::fs::File::open(path).await
+    let mut file = tokio::fs::File::open(path)
+        .await
         .with_context(|| format!("Cannot open {}", path.display()))?;
     let size = file.metadata().await?.len();
 
@@ -324,7 +348,9 @@ async fn upload(
     };
 
     let init = http
-        .post(format!("{UPLOAD_URL}?uploadType=resumable&part=snippet,status"))
+        .post(format!(
+            "{UPLOAD_URL}?uploadType=resumable&part=snippet,status"
+        ))
         .bearer_auth(&token.access_token)
         .header("Content-Type", "application/json; charset=UTF-8")
         .header("X-Upload-Content-Type", "video/mp4")
@@ -338,10 +364,12 @@ async fn upload(
         bail!("Could not start upload ({status}): {}", init.text().await?);
     }
 
-    let upload_url = init.headers()
+    let upload_url = init
+        .headers()
         .get("Location")
         .context("YouTube did not return an upload URL")?
-        .to_str()?.to_string();
+        .to_str()?
+        .to_string();
 
     let mut offset = 0_u64;
 
@@ -390,47 +418,25 @@ async fn upload(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        println!(
-            "FRC Match Clipper\n\n\
-             Usage:\n\
-             cargo run -- upload FILE --title TITLE \\\n\
-               --description DESCRIPTION --privacy unlisted\n"
-        );
-        return Ok(());
-    }
-
-    if args[0] != "upload" || args.len() < 2 {
-        bail!("Expected: upload FILE --title TITLE");
-    }
-
-    let path = Path::new(&args[1]);
-    let value = |flag: &str, default: Option<&str>| -> Result<String> {
-        match args.iter().position(|a| a == flag) {
-            Some(i) => args.get(i + 1).cloned()
-                .with_context(|| format!("Missing value after {flag}")),
-            None => default.map(str::to_string)
-                .with_context(|| format!("Missing {flag}")),
+    let _ = dotenvy::dotenv();
+    match cli::parse(std::env::args().skip(1).collect())? {
+        cli::Command::Help => println!("{}", cli::HELP),
+        cli::Command::Clip(args) => batch::run(args).await?,
+        cli::Command::Upload {
+            file,
+            title,
+            description,
+            privacy,
+        } => {
+            let google = load_google_client()?;
+            let http = Client::builder()
+                .user_agent("frc-match-clipper/0.1")
+                .timeout(Duration::from_secs(120))
+                .build()?;
+            let token = authenticate(&http, &google).await?;
+            let id = upload(&http, &token, &file, &title, &description, &privacy).await?;
+            println!("Upload complete: https://www.youtube.com/watch?v={id}");
         }
-    };
-
-    let title = value("--title", None)?;
-    let description = value("--description", Some("FRC match footage"))?;
-    let privacy = value("--privacy", Some("unlisted"))?;
-
-    let google = load_google_client()?;
-    let http = Client::builder()
-        .timeout(Duration::from_secs(3600))
-        .build()?;
-
-    let token = authenticate(&http, &google).await?;
-
-    let id = upload(
-        &http, &token, path, &title, &description, &privacy
-    ).await?;
-
-    println!("Upload complete: https://www.youtube.com/watch?v={id}");
+    }
     Ok(())
 }
