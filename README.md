@@ -17,7 +17,7 @@ Update with `brew update` followed by `brew upgrade frc-match-clipper`. Uninstal
 Alternatively, with a current Rust toolchain and the runtime tools installed:
 
 ```sh
-cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.1
+cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.2
 ```
 
 ## Configure once

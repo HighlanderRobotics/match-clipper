@@ -40,6 +40,17 @@ async fn save(path: &Path, manifest: &Manifest) -> Result<()> {
     tokio::fs::rename(tmp, path).await?;
     Ok(())
 }
+fn reconcile_rejected_uploads(m: &mut Manifest) {
+    for p in &mut m.progress {
+        // Older releases marked an explicit pre-transfer rejection as uncertain.
+        if p.status == Status::UploadFailed
+            && p.error.as_deref()
+                == Some("Could not start upload (400 Bad Request): uploadLimitExceeded")
+        {
+            p.status = Status::Clipped;
+        }
+    }
+}
 fn validate_manifest(m: &Manifest, plan: &Plan) -> Result<()> {
     if m.version != 1
         || m.plan != *plan
@@ -110,7 +121,8 @@ async fn run_locked(
     path: &Path,
 ) -> Result<()> {
     let mut manifest = if tokio::fs::try_exists(path).await? {
-        let m: Manifest = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        let mut m: Manifest = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        reconcile_rejected_uploads(&mut m);
         validate_manifest(&m, plan)?;
         m
     } else {
@@ -322,6 +334,24 @@ mod tests {
                 error: None,
             }],
         }
+    }
+    #[test]
+    fn old_channel_limit_rejection_is_safe_to_retry() {
+        let mut m = manifest();
+        m.progress[0].status = Status::UploadFailed;
+        m.progress[0].error =
+            Some("Could not start upload (400 Bad Request): uploadLimitExceeded".into());
+        reconcile_rejected_uploads(&mut m);
+        assert_eq!(m.progress[0].status, Status::Clipped);
+        assert!(validate_manifest(&m, &m.plan).is_ok());
+    }
+    #[test]
+    fn old_uncertain_transfer_remains_blocked() {
+        let mut m = manifest();
+        m.progress[0].status = Status::UploadFailed;
+        m.progress[0].error = Some("Upload failed (400 Bad Request): invalidRange".into());
+        reconcile_rejected_uploads(&mut m);
+        assert!(validate_manifest(&m, &m.plan).is_err());
     }
     #[test]
     fn completed_manifests_do_not_require_google_login() {
