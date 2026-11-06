@@ -2,9 +2,9 @@ class FrcMatchClipper < Formula
   desc "Clip FRC livestreams into match videos with resumable YouTube uploads"
   homepage "https://github.com/jackshim415/match-clipper"
   url "https://github.com/jackshim415/match-clipper.git",
-      tag: "v0.2.1",
-      revision: "8790ff6502f0b3355c85917b1a3e31140ea10651"
-  version "0.2.1"
+      tag: "v0.2.2",
+      revision: "c75b50f52d9c801879be1bff6d4b9f82d07578d5"
+  version "0.2.2"
 
   depends_on "rust" => :build
   depends_on "ffmpeg"
@@ -27,7 +27,7 @@ class FrcMatchClipper < Formula
   end
 
   test do
-    assert_match "frc-match-clipper 0.2.1", shell_output("#{bin}/frc-match-clipper --version")
+    assert_match "frc-match-clipper 0.2.2", shell_output("#{bin}/frc-match-clipper --version")
     assert_match "FRC Match Clipper", shell_output("#{bin}/frc-match-clipper --help")
   end
 end
