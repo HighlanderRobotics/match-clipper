@@ -1,6 +1,6 @@
 use crate::logging;
 use crate::{
-    authenticate,
+    authenticate_scope,
     cli::ClipArgs,
     clip::{self, Plan},
     load_google_client, upload,
@@ -130,14 +130,19 @@ async fn run_locked(
         }
     };
     save(path, &manifest).await?;
-    let google = if !needs_upload(args.no_upload, &manifest) {
+    let google = if !needs_upload(args.no_upload, &manifest)
+        && (args.no_upload || args.playlist.is_none())
+    {
         None
     } else {
         Some(load_google_client()?)
     };
     // Authenticate before downloading the first clip; refresh again before each upload.
     if let Some(g) = &google {
-        authenticate(http, g).await?;
+        let token = authenticate_scope(http, g, args.playlist.is_some()).await?;
+        if let Some(title) = &args.playlist {
+            crate::playlist::sync(http, &token, dir, title, &[]).await?;
+        }
     }
     let started = std::time::Instant::now();
     let mut resumed = 0;
@@ -165,6 +170,17 @@ async fn run_locked(
     let mut failed = 0;
     for (i, c) in plan.clips.iter().enumerate() {
         if manifest.progress[i].status == Status::Uploaded {
+            if let (Some(g), Some(title)) = (&google, &args.playlist) {
+                let token = authenticate_scope(http, g, true).await?;
+                crate::playlist::sync(
+                    http,
+                    &token,
+                    dir,
+                    title,
+                    &[manifest.progress[i].uploaded_video_id.clone().unwrap()],
+                )
+                .await?;
+            }
             resumed += 1;
             logging::info(
                 "clip_resumed",
@@ -221,7 +237,7 @@ async fn run_locked(
             save(path, &manifest).await?;
         }
         if let Some(g) = &google {
-            let token = authenticate(http, g).await?;
+            let token = authenticate_scope(http, g, args.playlist.is_some()).await?;
             manifest.progress[i].status = Status::Uploading;
             save(path, &manifest).await?;
             let title = format!(
@@ -246,15 +262,27 @@ async fn run_locked(
                         ),
                         json!({"match":c.match_key,"videoId":id}),
                     );
+                    if let Some(title) = &args.playlist {
+                        crate::playlist::sync(http, &token, dir, title, &[id]).await?;
+                    }
                     if !args.keep_clips {
                         tokio::fs::remove_file(&file).await?;
                     }
                 }
                 Err(e) => {
-                    manifest.progress[i].status = Status::UploadFailed;
+                    manifest.progress[i].status = if e.is::<crate::UploadNotStarted>() {
+                        Status::Clipped
+                    } else {
+                        Status::UploadFailed
+                    };
                     manifest.progress[i].error = Some(e.to_string());
                     save(path, &manifest).await?;
-                    return Err(e.context("Upload stopped; clip retained. Check YouTube Studio before retrying to prevent duplicates"));
+                    let message = if e.is::<crate::UploadNotStarted>() {
+                        "Upload rejected before transfer; clip retained. Resolve the provider limit, then rerun the same command"
+                    } else {
+                        "Upload stopped; clip retained. Check YouTube Studio before retrying to prevent duplicates"
+                    };
+                    return Err(e.context(message));
                 }
             }
         }

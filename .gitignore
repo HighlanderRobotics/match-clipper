@@ -12,3 +12,7 @@ input.mp4
 /clips/
 *.mp4
 *.webm
+
+# Private resumable upload URLs
+*.upload.json
+*.upload.json.tmp

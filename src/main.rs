@@ -3,6 +3,7 @@ mod cli;
 mod clip;
 mod config;
 mod logging;
+mod playlist;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Query, State},
@@ -32,6 +33,7 @@ const TOKEN_FILE: &str = "token.json";
 const REDIRECT: &str = "http://127.0.0.1:8765/callback";
 const UPLOAD_URL: &str = "https://www.googleapis.com/upload/youtube/v3/videos";
 const SCOPE: &str = "https://www.googleapis.com/auth/youtube.upload";
+const PLAYLIST_SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -53,6 +55,8 @@ struct Token {
     access_token: String,
     refresh_token: Option<String>,
     expires_at: u64,
+    #[serde(default)]
+    scope: String,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +106,15 @@ struct VideoStatus {
 struct UploadResponse {
     id: String,
 }
+
+#[derive(Debug)]
+struct UploadNotStarted(String);
+impl std::fmt::Display for UploadNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for UploadNotStarted {}
 
 fn now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -162,6 +175,7 @@ async fn exchange_code(
     google: &GoogleClient,
     code: &str,
     verifier: &str,
+    scope: &str,
 ) -> Result<Token> {
     let response = http
         .post(&google.token_uri)
@@ -190,6 +204,7 @@ async fn exchange_code(
     let token = Token {
         access_token: data.access_token,
         refresh_token: data.refresh_token,
+        scope: scope.to_owned(),
         expires_at: now() + data.expires_in.unwrap_or(3600),
     };
 
@@ -229,6 +244,7 @@ async fn refresh_token(http: &Client, google: &GoogleClient, old: &Token) -> Res
     let token = Token {
         access_token: data.access_token,
         refresh_token: data.refresh_token.or_else(|| old.refresh_token.clone()),
+        scope: old.scope.clone(),
         expires_at: now() + data.expires_in.unwrap_or(3600),
     };
 
@@ -260,13 +276,21 @@ async fn callback(
 }
 
 async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
+    authenticate_scope(http, google, false).await
+}
+async fn authenticate_scope(http: &Client, google: &GoogleClient, playlist: bool) -> Result<Token> {
+    let scope = if playlist { PLAYLIST_SCOPE } else { SCOPE };
     if let Ok(bytes) = fs::read(config::credential_file(TOKEN_FILE)) {
         if let Ok(token) = serde_json::from_slice::<Token>(&bytes) {
-            if token.expires_at > now() + 60 {
+            if (!playlist || token.scope.split_whitespace().any(|s| s == PLAYLIST_SCOPE))
+                && token.expires_at > now() + 60
+            {
                 return Ok(token);
             }
 
-            if token.refresh_token.is_some() {
+            if (!playlist || token.scope.split_whitespace().any(|s| s == PLAYLIST_SCOPE))
+                && token.refresh_token.is_some()
+            {
                 return refresh_token(http, google, &token).await;
             }
         }
@@ -282,7 +306,7 @@ async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
         .append_pair("client_id", &google.client_id)
         .append_pair("redirect_uri", REDIRECT)
         .append_pair("response_type", "code")
-        .append_pair("scope", SCOPE)
+        .append_pair("scope", scope)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
         .append_pair("state", &state_value)
@@ -327,7 +351,7 @@ async fn authenticate(http: &Client, google: &GoogleClient) -> Result<Token> {
 
         if let Some(code) = received {
             server.abort();
-            return exchange_code(http, google, &code, &verifier).await;
+            return exchange_code(http, google, &code, &verifier, scope).await;
         }
 
         if tokio::time::Instant::now() > deadline {
@@ -387,10 +411,10 @@ async fn upload(
 
     let status = init.status();
     if !status.is_success() {
-        bail!(
-            "Could not start upload ({status}): {}",
+        return Err(UploadNotStarted(format!(
+            "Could not start upload ({status}): {}. No video bytes were sent; the clip is retained for retry",
             provider_error(&init.text().await?)
-        );
+        )).into());
     }
 
     let upload_url = init

@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --dry-run               Print clip plan without downloading/uploading\n\nGlobal options (before or after the command):\n  --log-format text|json  Human logs or JSON lines on stderr\n  --quiet                Only warnings and errors\n  --verbose              Debug timings and context\n  --no-color             Disable ANSI colors\n  --config-dir DIR       Directory containing .env and Google credentials\n  --version              Print version\n  config-path            Print the default configuration directory\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the current directory.\n";
+pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --playlist TITLE        Create/resume an unlisted playlist for this run\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --dry-run               Print clip plan without downloading/uploading\n\nGlobal options (before or after the command):\n  --log-format text|json  Human logs or JSON lines on stderr\n  --quiet                Only warnings and errors\n  --verbose              Debug timings and context\n  --no-color             Disable ANSI colors\n  --config-dir DIR       Directory containing .env and Google credentials\n  --version              Print version\n  config-path            Print the default configuration directory\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the current directory.\n";
 
 #[derive(Debug, Clone)]
 pub struct ClipArgs {
+    pub playlist: Option<String>,
     pub livestream: String,
     pub event: String,
     pub output: Option<PathBuf>,
@@ -78,6 +79,7 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
     }
     let allowed: &[&str] = if command == "clip" {
         &[
+            "--playlist",
             "--event",
             "--output",
             "--offset-seconds",
@@ -146,6 +148,7 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
         bail!("Invalid timing: lead-in/post-roll 0–300, duration 1–900, offset within one day");
     }
     Ok(Command::Clip(ClipArgs {
+        playlist: options.remove("--playlist"),
         livestream: input.or(youtube).context("Missing livestream URL or ID")?,
         event,
         output: options.remove("--output").map(PathBuf::from),

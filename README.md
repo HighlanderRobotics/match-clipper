@@ -17,7 +17,7 @@ Update with `brew update` followed by `brew upgrade frc-match-clipper`. Uninstal
 Alternatively, with a current Rust toolchain and the runtime tools installed:
 
 ```sh
-cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.0
+cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.1
 ```
 
 ## Configure once
@@ -44,7 +44,7 @@ frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
 
 # Clip and upload every played match inside this stream's time interval.
 frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
-  --event 2026cacg
+  --event 2026cacg --offset-seconds 139 --playlist "CalGames 2026 Saturday"
 ```
 
 Videos default to **unlisted**; use `--privacy private` or `--privacy public` explicitly to change that. Uploads go to the channel authorized by the cached Google token. The CLI does not publish links to TBA or modify Lovat.
@@ -63,7 +63,7 @@ Outputs default to `clips/EVENT/VIDEO/`, or choose `--output DIR`. Each director
 
 An `.running` file prevents concurrent runs in the same output directory. After a crash, confirm the old process has stopped before removing this lock. If an upload response is lost, the CLI stops instead of automatically risking a duplicate. Check YouTube Studio: if it succeeded, set the entry's `status` to `uploaded` and `uploaded_video_id` to its 11-character ID; otherwise set `status` to `clipped`, then resume. Do not delete the manifest to retry.
 
-YouTube quota, provider throttling, and account upload limits can stop a large batch. Completed uploads remain checkpointed. This CLI does not bypass those restrictions.
+YouTube quota, provider throttling, and account upload limits can stop a large batch. Completed uploads remain checkpointed. This CLI does not bypass those restrictions. `uploadLimitExceeded` means the channel rejected a new upload before video transfer; it is not a failed confirmation. The clip stays `clipped` and can be retried after the channel limit clears. A failed/uncertain transfer still stops for manual reconciliation.
 
 ## Upload an existing clip
 
@@ -102,3 +102,9 @@ The CalGames Saturday 2026 stream (`N1hIhUTuO5w`) produced a 38-match plan. Its 
 frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
   --event 2026cacg --offset-seconds 139 --dry-run
 ```
+
+## Playlists
+
+Add `--playlist "Event day"` to a clip command. The CLI creates an unlisted playlist and adds each confirmed upload in match order. `playlist.json` checkpoints its ID. Resuming reads existing playlist membership before inserting, so already added videos are skipped. An uncertain playlist creation stops for manual reconciliation instead of creating a duplicate. Keep the same title on resume. Each stream/output directory has its own playlist.
+
+Playlist management requires Google's `youtube.force-ssl` permission in addition to the earlier upload grant. The first playlist run opens a consent page; existing upload-only credentials are preserved until authorization succeeds. Use the same Google account/channel as before. `--no-upload` and `--dry-run` create no playlist.
