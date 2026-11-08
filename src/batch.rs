@@ -53,7 +53,12 @@ fn reconcile_rejected_uploads(m: &mut Manifest) {
 }
 fn validate_manifest(m: &Manifest, plan: &Plan) -> Result<()> {
     if m.version != 1
-        || m.plan != *plan
+        // Other event days can acquire timestamps after this stream was clipped.
+        // That diagnostic count is not part of the immutable upload plan.
+        || m.plan.event != plan.event
+        || m.plan.video_id != plan.video_id
+        || m.plan.privacy != plan.privacy
+        || m.plan.clips != plan.clips
         || m.progress.len() != plan.clips.len()
         || m.progress
             .iter()
@@ -387,6 +392,35 @@ mod tests {
         let mut p = m.plan.clone();
         p.clips[0].start_seconds = 1;
         assert!(validate_manifest(&m, &p).is_err());
+    }
+    #[test]
+    fn updated_event_timestamp_counts_do_not_block_resume() {
+        let m = manifest();
+        let mut p = m.plan.clone();
+        p.skipped_without_actual_time = 18;
+        assert!(validate_manifest(&m, &p).is_ok());
+        let mut uploaded = manifest();
+        uploaded.progress[0].status = Status::Uploaded;
+        uploaded.progress[0].uploaded_video_id = Some("abcdefghijk".into());
+        assert!(validate_manifest(&uploaded, &p).is_ok());
+        assert!(!needs_upload(false, &uploaded));
+    }
+    #[test]
+    fn updated_diagnostics_do_not_allow_changed_upload_plans() {
+        let m = manifest();
+        for field in 0..6 {
+            let mut p = m.plan.clone();
+            p.skipped_without_actual_time = 18;
+            match field {
+                0 => p.event = "2026mttd".into(),
+                1 => p.video_id = "CI6Dm6TSHzs".into(),
+                2 => p.privacy = "public".into(),
+                3 => p.clips[0].end_seconds += 1,
+                4 => p.clips[0].match_key = "2026cacg_qm2".into(),
+                _ => p.clips.clear(),
+            }
+            assert!(validate_manifest(&m, &p).is_err());
+        }
     }
     #[test]
     fn uncertain_upload_blocks_duplicates() {
