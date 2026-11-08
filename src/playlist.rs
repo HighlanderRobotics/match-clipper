@@ -9,7 +9,12 @@ use std::{collections::HashSet, path::Path};
 #[derive(Serialize, Deserialize)]
 struct State {
     title: String,
+    #[serde(default = "default_privacy")]
+    privacy: String,
     id: Option<String>,
+}
+fn default_privacy() -> String {
+    "unlisted".into()
 }
 async fn save(path: &Path, state: &State) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
@@ -28,9 +33,12 @@ async fn response(r: reqwest::Response) -> Result<Value> {
     }
     Ok(serde_json::from_str(&text)?)
 }
-fn validate(state: &State, title: &str) -> Result<()> {
+fn validate(state: &State, title: &str, privacy: &str) -> Result<()> {
     if state.title != title {
         bail!("Playlist title differs from playlist.json; use the original title");
+    }
+    if state.privacy != privacy {
+        bail!("Playlist privacy differs from playlist.json; use the original privacy");
     }
     if state.id.is_none() {
         bail!("Uncertain playlist creation. Check YouTube Studio and set its ID in playlist.json before resuming; do not recreate blindly");
@@ -42,16 +50,18 @@ pub async fn sync(
     token: &Token,
     dir: &Path,
     title: &str,
+    privacy: &str,
     videos: &[String],
 ) -> Result<()> {
     let path = dir.join("playlist.json");
     let state = if tokio::fs::try_exists(&path).await? {
         let s: State = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
-        validate(&s, title)?;
+        validate(&s, title, privacy)?;
         s
     } else {
         let mut s = State {
             title: title.into(),
+            privacy: privacy.into(),
             id: None,
         };
         save(&path, &s).await?; // Never retry ambiguous creation automatically.
@@ -59,7 +69,7 @@ pub async fn sync(
             http.post("https://www.googleapis.com/youtube/v3/playlists")
                 .query(&[("part", "snippet,status")])
                 .bearer_auth(&token.access_token)
-                .json(&json!({"snippet":{"title":title},"status":{"privacyStatus":"unlisted"}}))
+                .json(&json!({"snippet":{"title":title},"status":{"privacyStatus":privacy}}))
                 .send()
                 .await?,
         )
@@ -131,17 +141,26 @@ mod tests {
     fn interrupted_creation_cannot_duplicate_playlist() {
         let s = State {
             title: "Saturday".into(),
+            privacy: "unlisted".into(),
             id: None,
         };
-        assert!(validate(&s, "Saturday").is_err());
+        assert!(validate(&s, "Saturday", "unlisted").is_err());
     }
     #[test]
     fn resumed_playlist_must_match_title() {
         let s = State {
             title: "Saturday".into(),
+            privacy: "unlisted".into(),
             id: Some("PLexisting".into()),
         };
-        assert!(validate(&s, "Saturday").is_ok());
-        assert!(validate(&s, "Sunday").is_err());
+        assert!(validate(&s, "Saturday", "unlisted").is_ok());
+        assert!(validate(&s, "Sunday", "unlisted").is_err());
+        assert!(validate(&s, "Saturday", "public").is_err());
+    }
+    #[test]
+    fn legacy_state_preserves_unlisted_privacy() {
+        let s: State = serde_json::from_str(r#"{"title":"Saturday","id":"PLexisting"}"#).unwrap();
+        assert!(validate(&s, "Saturday", "unlisted").is_ok());
+        assert!(validate(&s, "Saturday", "public").is_err());
     }
 }

@@ -149,11 +149,22 @@ async fn run_locked(
     } else {
         Some(load_google_client()?)
     };
+    let upload_text = if needs_upload(args.no_upload, &manifest) {
+        crate::metadata::load(http, plan).await?
+    } else {
+        std::collections::HashMap::new()
+    };
+    if !upload_text.is_empty() {
+        let preview = dir.join("upload-metadata.json");
+        let temporary = preview.with_extension("json.tmp");
+        tokio::fs::write(&temporary, serde_json::to_vec_pretty(&upload_text)?).await?;
+        tokio::fs::rename(temporary, preview).await?;
+    }
     // Authenticate before downloading the first clip; refresh again before each upload.
     if let Some(g) = &google {
         let token = authenticate_scope(http, g, args.playlist.is_some()).await?;
         if let Some(title) = &args.playlist {
-            crate::playlist::sync(http, &token, dir, title, &[]).await?;
+            crate::playlist::sync(http, &token, dir, title, &args.privacy, &[]).await?;
         }
     }
     let started = std::time::Instant::now();
@@ -189,6 +200,7 @@ async fn run_locked(
                     &token,
                     dir,
                     title,
+                    &args.privacy,
                     &[manifest.progress[i].uploaded_video_id.clone().unwrap()],
                 )
                 .await?;
@@ -252,16 +264,19 @@ async fn run_locked(
             let token = authenticate_scope(http, g, args.playlist.is_some()).await?;
             manifest.progress[i].status = Status::Uploading;
             save(path, &manifest).await?;
-            let title = format!(
-                "{} {}",
-                args.event,
-                c.match_key
-                    .strip_prefix(&format!("{}_", args.event))
-                    .unwrap_or(&c.match_key)
-                    .to_uppercase()
-            );
-            let description=format!("FIRST Robotics Competition {}\nMatch: {}\nSource: https://www.youtube.com/watch?v={}\nVOD range: {}–{} seconds",args.event,c.match_key,plan.video_id,c.start_seconds,c.end_seconds);
-            match upload(http, &token, &file, &title, &description, &args.privacy).await {
+            let text = upload_text
+                .get(&c.match_key)
+                .context("Upload metadata missing")?;
+            match upload(
+                http,
+                &token,
+                &file,
+                &text.title,
+                &text.description,
+                &args.privacy,
+            )
+            .await
+            {
                 Ok(id) => {
                     manifest.progress[i].status = Status::Uploaded;
                     manifest.progress[i].uploaded_video_id = Some(id.clone());
@@ -275,7 +290,8 @@ async fn run_locked(
                         json!({"match":c.match_key,"videoId":id}),
                     );
                     if let Some(title) = &args.playlist {
-                        crate::playlist::sync(http, &token, dir, title, &[id]).await?;
+                        crate::playlist::sync(http, &token, dir, title, &args.privacy, &[id])
+                            .await?;
                     }
                     if !args.keep_clips {
                         tokio::fs::remove_file(&file).await?;

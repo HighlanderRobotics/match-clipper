@@ -3,6 +3,7 @@ mod cli;
 mod clip;
 mod config;
 mod logging;
+mod metadata;
 mod playlist;
 use anyhow::{bail, Context, Result};
 use axum::{

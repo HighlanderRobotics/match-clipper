@@ -202,6 +202,213 @@ pub fn plan_matches(
         skipped_without_actual_time: matches.iter().filter(|m| m.actual_time.is_none()).count(),
     })
 }
+struct FragmentFiles([std::path::PathBuf; 2]);
+impl Drop for FragmentFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+#[derive(Deserialize)]
+struct FragmentFormat {
+    url: String,
+    protocol: String,
+    target_duration: Option<f64>,
+}
+fn fragment_range(start: i64, end: i64, duration: f64) -> Result<std::ops::Range<u64>> {
+    if !duration.is_finite() || !(0.1..=30.0).contains(&duration) || start < 0 || end <= start {
+        bail!("Invalid fragment timing");
+    }
+    // Keep boundary fragments for keyframes and minor segment timestamp drift.
+    let first = ((start as f64 / duration).floor() as u64).saturating_sub(3);
+    let last = (end as f64 / duration).ceil() as u64 + 3;
+    if last - first > 12000 {
+        bail!("Fragment section exceeds bounded download limit");
+    }
+    Ok(first..last)
+}
+async fn fragment_section(video_id: &str, clip: &PlannedClip, partial: &Path) -> Result<()> {
+    let result = Command::new("yt-dlp")
+        .args([
+            "--ignore-config",
+            "--no-playlist",
+            "--socket-timeout",
+            "15",
+            "--retries",
+            "1",
+            "--js-runtimes",
+            "node",
+            "--skip-download",
+            "-f",
+            "bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]",
+            "--print",
+            "%(requested_formats.:.{url,protocol,target_duration})j",
+            "--",
+        ])
+        .arg(format!("https://www.youtube.com/watch?v={video_id}"))
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), result)
+        .await
+        .context("Fragment metadata timed out")??;
+    if !output.status.success() {
+        bail!(
+            "Fragment metadata failed: {}",
+            crate::logging::diagnostic(&String::from_utf8_lossy(&output.stderr))
+        );
+    }
+    let formats: Vec<FragmentFormat> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("Invalid fragment format metadata"))?;
+    if formats.len() != 2
+        || formats
+            .iter()
+            .any(|f| f.protocol != "http_dash_segments" || f.target_duration.is_none())
+    {
+        bail!("Source does not expose supported archived livestream fragments");
+    }
+    let http = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let files = FragmentFiles([
+        partial.with_extension("video.fragments"),
+        partial.with_extension("audio.fragments"),
+    ]);
+    let paths = &files.0;
+    let result = async {
+        use tokio::io::AsyncWriteExt;
+        let mut starts = Vec::new();
+        for (format, path) in formats.iter().zip(paths) {
+            let range = fragment_range(
+                clip.start_seconds,
+                clip.end_seconds,
+                format.target_duration.unwrap(),
+            )?;
+            let base =
+                Url::parse(&format.url).map_err(|_| anyhow::anyhow!("Invalid fragment URL"))?;
+            if base.scheme() != "https"
+                || !base
+                    .host_str()
+                    .is_some_and(|h| h.ends_with(".googlevideo.com"))
+            {
+                bail!("Unexpected fragment host");
+            }
+            let mut file = tokio::fs::File::create(path).await?;
+            let numbers: Vec<_> = range.collect();
+            for group in numbers.chunks(4) {
+                let mut tasks = tokio::task::JoinSet::new();
+                for &sq in group {
+                    let mut url = base.clone();
+                    let pairs: Vec<_> = url
+                        .query_pairs()
+                        .filter(|(k, _)| k != "sq")
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect();
+                    url.query_pairs_mut()
+                        .clear()
+                        .extend_pairs(pairs)
+                        .append_pair("sq", &sq.to_string());
+                    let http = http.clone();
+                    tasks.spawn(async move {
+                        for attempt in 0..3 {
+                            let response = http.get(url.clone()).send().await;
+                            if let Ok(r) = response {
+                                if r.status().is_success()
+                                    && r.content_length().unwrap_or(0) <= 16 * 1024 * 1024
+                                {
+                                    if let Ok(bytes) = r.bytes().await {
+                                        if !bytes.is_empty() && bytes.len() <= 16 * 1024 * 1024 {
+                                            return Ok((sq, bytes));
+                                        }
+                                    }
+                                }
+                            }
+                            if attempt < 2 {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                        Err(anyhow::anyhow!("Could not download fragment {sq}"))
+                    });
+                }
+                let mut chunks = Vec::new();
+                while let Some(r) = tasks.join_next().await {
+                    chunks.push(r??);
+                }
+                chunks.sort_by_key(|(sq, _)| *sq);
+                for (_, bytes) in chunks {
+                    file.write_all(&bytes).await?;
+                }
+            }
+            drop(file);
+            let probe = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=start_time",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                ])
+                .arg(path)
+                .output()
+                .await?;
+            let start: f64 = String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .parse()
+                .context("Fragment start timestamp missing")?;
+            if !probe.status.success() || !start.is_finite() || start > clip.start_seconds as f64 {
+                bail!("Fragments do not cover the requested start");
+            }
+            starts.push(start);
+        }
+        let mut ffmpeg = Command::new("ffmpeg");
+        ffmpeg.args(["-y", "-loglevel", "error", "-nostdin"]);
+        for (path, start) in paths.iter().zip(starts) {
+            ffmpeg
+                .arg("-ss")
+                .arg(format!("{:.6}", clip.start_seconds as f64 - start))
+                .arg("-i")
+                .arg(path);
+        }
+        let output = ffmpeg
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-t"])
+            .arg((clip.end_seconds - clip.start_seconds).to_string())
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-threads",
+                "2",
+                "-r",
+                "30",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+            ])
+            .arg(partial)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!(
+                "Fragment trim failed: {}",
+                crate::logging::diagnostic(&String::from_utf8_lossy(&output.stderr))
+            );
+        }
+        Ok(())
+    }
+    .await;
+    result
+}
+
 pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> Result<()> {
     let partial = path.with_extension("partial.mp4");
     let download = Command::new("yt-dlp")
@@ -267,6 +474,32 @@ pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> R
             bail!("Download timed out after 15 minutes for {}", clip.match_key);
         }
     }
+    if tokio::fs::metadata(&partial)
+        .await
+        .map(|m| m.len() < 1024)
+        .unwrap_or(false)
+    {
+        crate::logging::warn(
+            "fragment_fallback",
+            "Empty section download; fetching bounded archived livestream fragments",
+            serde_json::json!({"match":clip.match_key}),
+        );
+        let fallback = tokio::time::timeout(
+            std::time::Duration::from_secs(900),
+            fragment_section(video_id, clip, &partial),
+        )
+        .await;
+        match fallback {
+            Ok(Ok(())) => {}
+            other => {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return match other {
+                    Ok(Err(e)) => Err(e),
+                    _ => Err(anyhow::anyhow!("Fragment section timed out")),
+                };
+            }
+        }
+    }
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -315,6 +548,40 @@ mod tests {
             key: format!("2026cacg_qm{n}"),
             actual_time: t,
         }
+    }
+    #[tokio::test]
+    async fn interrupted_fragment_download_removes_temporary_files() {
+        let root =
+            std::env::temp_dir().join(format!("clipper-fragments-{}", crate::random_string(12)));
+        std::fs::create_dir(&root).unwrap();
+        let paths = [root.join("video"), root.join("audio")];
+        let task_paths = paths.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _files = FragmentFiles(task_paths.clone());
+            for path in task_paths {
+                std::fs::write(path, b"fragment").unwrap();
+            }
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        assert!(paths.iter().all(|p| p.exists()));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(paths.iter().all(|p| !p.exists()));
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn bounded_fragment_windows() {
+        assert_eq!(fragment_range(370, 556, 2.0).unwrap(), 182..281);
+        assert_eq!(fragment_range(0, 186, 2.0).unwrap(), 0..96);
+        for d in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(fragment_range(0, 186, d).is_err());
+        }
+        assert!(fragment_range(-1, 186, 2.0).is_err());
+        assert!(fragment_range(186, 0, 2.0).is_err());
+        assert!(fragment_range(0, 86400, 0.1).is_err());
     }
     #[test]
     fn youtube_urls() {

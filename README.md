@@ -5,8 +5,8 @@ A Rust CLI that turns an archived YouTube livestream into one video per played F
 ## Install with Homebrew
 
 ```sh
-brew tap jackshim415/match-clipper https://github.com/jackshim415/match-clipper.git
-brew install jackshim415/match-clipper/frc-match-clipper
+brew tap HighlanderRobotics/match-clipper https://github.com/HighlanderRobotics/match-clipper.git
+brew install HighlanderRobotics/match-clipper/frc-match-clipper
 frc-match-clipper --version
 ```
 
@@ -17,7 +17,7 @@ Update with `brew update` followed by `brew upgrade frc-match-clipper`. Uninstal
 Alternatively, with a current Rust toolchain and the runtime tools installed:
 
 ```sh
-cargo install --locked --git https://github.com/jackshim415/match-clipper.git --tag v0.2.2
+cargo install --locked --git https://github.com/HighlanderRobotics/match-clipper.git --tag v0.2.2
 ```
 
 ## Configure once
@@ -47,6 +47,8 @@ frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
   --event 2026cacg --offset-seconds 139 --playlist "CalGames 2026 Saturday"
 ```
 
+Each upload includes the official event/match name, alliance team numbers (including B/C aliases and their FMS numbers, such as `8033B (9987)`), final TBA scores, a TBA match link, the source stream and clip interval, and FRC 8033 / source-code attribution. Uploads stop before publishing if required teams or final scores are missing.
+
 Videos default to **unlisted**; use `--privacy private` or `--privacy public` explicitly to change that. Uploads go to the channel authorized by the cached Google token. The CLI does not publish links to TBA or modify Lovat.
 
 The default clip starts eight seconds before the TBA actual start, includes 163 seconds of play/transition, and retains 15 seconds afterward. Use `--match-duration` for another season or event rules. Qualifications and playoffs are both included when their actual timestamps lie inside the stream. Missing actual timestamps are counted in the plan and skipped; estimates from scheduled times are never used.
@@ -55,7 +57,7 @@ The default clip starts eight seconds before the TBA actual start, includes 163 
 
 A stream's wall-clock start can differ from its VOD playback origin, and TBA's actual start can differ from the broadcast. Verify the sample's opening countdown and final clock before uploading a whole event. `--offset-seconds 139` moves every clip 139 seconds later; negative values move clips earlier. There is no universal offset. Plans reject offsets that place a selected match outside the stream or truncate play at the end of the recording.
 
-Only completed archived streams with both start and end metadata are accepted. This is not a live recorder. Clip boundaries are re-encoded with `--force-keyframes-at-cuts`, and FFprobe checks the resulting duration within three seconds. Audio is included when available. The tool downloads sections sequentially rather than retaining an entire event VOD; a successful upload removes its local video unless `--keep-clips` is set. `--no-upload` always keeps clips.
+Only completed archived streams with both start and end metadata are accepted. This is not a live recorder. Clip boundaries are re-encoded with `--force-keyframes-at-cuts`, and FFprobe checks the resulting duration within three seconds. For newly ended livestreams still served as DASH fragments, an empty FFmpeg section triggers a bounded fragment download and local trim. Temporary fragments are removed on completion, failure, or cancellation. Audio is included when available. The tool downloads sections sequentially rather than retaining an entire event VOD; a successful upload removes its local video unless `--keep-clips` is set. `--no-upload` always keeps clips.
 
 ### Resume
 
@@ -105,6 +107,6 @@ frc-match-clipper clip https://www.youtube.com/live/N1hIhUTuO5w \
 
 ## Playlists
 
-Add `--playlist "Event day"` to a clip command. The CLI creates an unlisted playlist and adds each confirmed upload in match order. `playlist.json` checkpoints its ID. Resuming reads existing playlist membership before inserting, so already added videos are skipped. An uncertain playlist creation stops for manual reconciliation instead of creating a duplicate. Keep the same title on resume. Each stream/output directory has its own playlist.
+Add `--playlist "Event day"` to a clip command. The CLI creates a playlist with the same `--privacy` as the videos (unlisted by default) and adds each confirmed upload in match order. Use `--privacy public --playlist "Madtown Throwdown 2026 Saturday"` for a public playlist and public clips. `playlist.json` checkpoints its ID. Resuming reads existing playlist membership before inserting, so already added videos are skipped. An uncertain playlist creation stops for manual reconciliation instead of creating a duplicate. Keep the same title and privacy on resume. Each stream/output directory has its own playlist.
 
 Playlist management requires Google's `youtube.force-ssl` permission in addition to the earlier upload grant. The first playlist run opens a consent page; existing upload-only credentials are preserved until authorization succeeds. Use the same Google account/channel as before. `--no-upload` and `--dry-run` create no playlist.
