@@ -228,7 +228,12 @@ fn fragment_range(start: i64, end: i64, duration: f64) -> Result<std::ops::Range
     }
     Ok(first..last)
 }
-async fn fragment_section(video_id: &str, clip: &PlannedClip, partial: &Path) -> Result<()> {
+async fn fragment_section(
+    video_id: &str,
+    clip: &PlannedClip,
+    partial: &Path,
+    hardware_encode: bool,
+) -> Result<()> {
     let result = Command::new("yt-dlp")
         .args([
             "--ignore-config",
@@ -371,18 +376,25 @@ async fn fragment_section(video_id: &str, clip: &PlannedClip, partial: &Path) ->
                 .arg("-i")
                 .arg(path);
         }
-        let output = ffmpeg
+        ffmpeg
             .args(["-map", "0:v:0", "-map", "1:a:0", "-t"])
-            .arg((clip.end_seconds - clip.start_seconds).to_string())
-            .args([
+            .arg((clip.end_seconds - clip.start_seconds).to_string());
+        if hardware_encode {
+            ffmpeg.args([
                 "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-threads",
-                "2",
+                "h264_videotoolbox",
+                "-allow_sw",
+                "0",
+                "-b:v",
+                "4000k",
+            ]);
+        } else {
+            ffmpeg.args([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", "2",
+            ]);
+        }
+        let output = ffmpeg
+            .args([
                 "-r",
                 "30",
                 "-c:a",
@@ -409,7 +421,12 @@ async fn fragment_section(video_id: &str, clip: &PlannedClip, partial: &Path) ->
     result
 }
 
-pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> Result<()> {
+pub async fn download_clip(
+    video_id: &str,
+    clip: &PlannedClip,
+    path: &Path,
+    hardware_encode: bool,
+) -> Result<()> {
     let partial = path.with_extension("partial.mp4");
     let download = Command::new("yt-dlp")
         .args([
@@ -430,7 +447,7 @@ pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> R
         .args([
             "--force-keyframes-at-cuts",
             "--downloader-args",
-            "ffmpeg_o:-c:v libx264 -preset veryfast -crf 23 -threads 2 -r 30 -loglevel error -nostats",
+            if hardware_encode { "ffmpeg_o:-c:v h264_videotoolbox -allow_sw 0 -b:v 4000k -r 30 -loglevel error -nostats" } else { "ffmpeg_o:-c:v libx264 -preset veryfast -crf 23 -threads 2 -r 30 -loglevel error -nostats" },
             "-f",
             "bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]",
             "--merge-output-format",
@@ -486,7 +503,7 @@ pub async fn download_clip(video_id: &str, clip: &PlannedClip, path: &Path) -> R
         );
         let fallback = tokio::time::timeout(
             std::time::Duration::from_secs(900),
-            fragment_section(video_id, clip, &partial),
+            fragment_section(video_id, clip, &partial, hardware_encode),
         )
         .await;
         match fallback {

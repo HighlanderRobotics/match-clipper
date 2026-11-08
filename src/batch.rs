@@ -233,7 +233,9 @@ async fn run_locked(
                 ),
                 json!({"match":c.match_key,"index":i+1,"total":plan.clips.len(),"startSeconds":c.start_seconds,"endSeconds":c.end_seconds}),
             );
-            if let Err(e) = clip::download_clip(&plan.video_id, c, &file).await {
+            if let Err(e) =
+                clip::download_clip(&plan.video_id, c, &file, args.hardware_encode).await
+            {
                 manifest.progress[i].status = Status::ClipFailed;
                 manifest.progress[i].error = Some(e.to_string());
                 save(path, &manifest).await?;

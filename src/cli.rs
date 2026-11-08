@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --playlist TITLE        Create/resume a playlist using --privacy\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --dry-run               Print clip plan without downloading/uploading\n\nGlobal options (before or after the command):\n  --log-format text|json  Human logs or JSON lines on stderr\n  --quiet                Only warnings and errors\n  --verbose              Debug timings and context\n  --no-color             Disable ANSI colors\n  --config-dir DIR       Directory containing .env and Google credentials\n  --version              Print version\n  config-path            Print the default configuration directory\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the configuration directory (legacy current-directory pairs are supported).\n";
+pub const HELP: &str = "FRC Match Clipper\n\n  frc-match-clipper clip LIVESTREAM --event EVENT [OPTIONS]\n  frc-match-clipper upload FILE --title TITLE [--description TEXT] [--privacy unlisted]\n\nclip options:\n  --playlist TITLE        Create/resume a playlist using --privacy\n  --output DIR            Clips and resumable manifest (default: clips/EVENT/VIDEO)\n  --offset-seconds N      VOD timeline correction, signed (default: 0)\n  --lead-in N             Seconds before match (default: 8)\n  --match-duration N      Match including transition (default: 163)\n  --post-roll N           Seconds after match (default: 15)\n  --start-match KEY       First match key or qm number (optional)\n  --stop-match KEY        Last match key or qm number (optional)\n  --privacy VALUE         private, unlisted, public (default: unlisted)\n  --no-upload             Keep clips without publishing\n  --keep-clips            Retain local clips after successful uploads\n  --hardware-encode       Use macOS VideoToolbox H.264 encoding\n  --dry-run               Print clip plan without downloading/uploading\n\nGlobal options (before or after the command):\n  --log-format text|json  Human logs or JSON lines on stderr\n  --quiet                Only warnings and errors\n  --verbose              Debug timings and context\n  --no-color             Disable ANSI colors\n  --config-dir DIR       Directory containing .env and Google credentials\n  --version              Print version\n  config-path            Print the default configuration directory\n\nRequires yt-dlp, ffmpeg, TBA_API_KEY (or TBA_KEY), YOUTUBE_API_KEY.\nUploads use client_secret.json and cached token.json in the configuration directory (legacy current-directory pairs are supported).\n";
 
 #[derive(Debug, Clone)]
 pub struct ClipArgs {
@@ -18,6 +18,7 @@ pub struct ClipArgs {
     pub privacy: String,
     pub no_upload: bool,
     pub keep_clips: bool,
+    pub hardware_encode: bool,
     pub dry_run: bool,
 }
 #[derive(Debug)]
@@ -59,7 +60,13 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
     while i < args.len() {
         let key = &args[i];
         if key.starts_with("--") {
-            let is_switch = ["--no-upload", "--keep-clips", "--dry-run"].contains(&key.as_str());
+            let is_switch = [
+                "--no-upload",
+                "--keep-clips",
+                "--dry-run",
+                "--hardware-encode",
+            ]
+            .contains(&key.as_str());
             let value = if is_switch {
                 "true".to_owned()
             } else {
@@ -91,6 +98,7 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
             "--privacy",
             "--no-upload",
             "--keep-clips",
+            "--hardware-encode",
             "--dry-run",
             "--youtube",
         ]
@@ -161,6 +169,7 @@ pub fn parse(args: Vec<String>) -> Result<Command> {
         privacy: p,
         no_upload: options.contains_key("--no-upload"),
         keep_clips: options.contains_key("--keep-clips"),
+        hardware_encode: options.contains_key("--hardware-encode"),
         dry_run: options.contains_key("--dry-run"),
     }))
 }
@@ -284,11 +293,11 @@ mod tests {
             Command::Upload { .. }
         ));
         let Command::Clip(c) = parse(args(
-            "clip --youtube abcdefghijk --event 2026cacg --no-upload --dry-run",
+            "clip --youtube abcdefghijk --event 2026cacg --no-upload --dry-run --hardware-encode",
         ))
         .unwrap() else {
             panic!()
         };
-        assert!(c.no_upload && c.dry_run);
+        assert!(c.no_upload && c.dry_run && c.hardware_encode);
     }
 }
